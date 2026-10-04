@@ -433,6 +433,24 @@ input[type="date"].input{min-height:52px;display:block}
 .welcome-points li{display:flex;gap:14px;align-items:center;color:var(--ink-2);font-size:15.5px;line-height:1.35}
 .pt-ico{width:42px;height:42px;border-radius:12px;background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}
 .pt-ico svg{width:22px;height:22px}
+.scanner{position:fixed;inset:0;z-index:200;background:#000;color:#fff;display:flex;flex-direction:column}
+.scanner video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.scan-frame{position:absolute;left:7%;right:7%;top:calc(env(safe-area-inset-top,0px) + 80px);bottom:calc(env(safe-area-inset-bottom,0px) + 190px);border-radius:18px;box-shadow:0 0 0 100vmax rgba(0,0,0,.45);pointer-events:none}
+.scan-frame i{position:absolute;width:34px;height:34px;border:4px solid #fff;border-radius:6px}
+.scan-frame i:nth-child(1){left:-2px;top:-2px;border-right:0;border-bottom:0}
+.scan-frame i:nth-child(2){right:-2px;top:-2px;border-left:0;border-bottom:0}
+.scan-frame i:nth-child(3){left:-2px;bottom:-2px;border-right:0;border-top:0}
+.scan-frame i:nth-child(4){right:-2px;bottom:-2px;border-left:0;border-top:0}
+.scan-top{position:relative;display:flex;justify-content:space-between;padding:calc(env(safe-area-inset-top,0px) + 14px) 14px 0}
+.scan-btn{width:48px;height:48px;border-radius:50%;border:0;background:rgba(0,0,0,.5);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.scan-btn svg{width:24px;height:24px}
+.scan-btn.on{background:#ffd34d;color:#222}
+.scan-bottom{position:absolute;left:0;right:0;bottom:0;padding:14px 20px calc(env(safe-area-inset-bottom,0px) + 22px);display:flex;flex-direction:column;align-items:center;gap:12px;text-align:center}
+.scan-msg{margin:0;font-weight:700;font-size:16.5px;text-shadow:0 1px 3px rgba(0,0,0,.6)}
+.scan-sub{margin:0;font-size:13.5px;opacity:.85;max-width:300px;text-shadow:0 1px 3px rgba(0,0,0,.6)}
+.scan-shutter{width:74px;height:74px;border-radius:50%;border:5px solid rgba(255,255,255,.85);background:#fff;background-clip:content-box;padding:4px;cursor:pointer}
+.scanner.flash::after{content:"";position:absolute;inset:0;background:#fff;animation:scanflash .35s ease-out forwards;pointer-events:none}
+@keyframes scanflash{from{opacity:.9}to{opacity:0}}
 .actions-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(0,1fr));gap:10px}
 .actions-row .btn{padding:0 12px}
 .danger-text{color:var(--bad-ink) !important}
@@ -1694,6 +1712,58 @@ const PdfText = {
       return out.replace(/\s+/g, ' ').trim();
     }).filter(Boolean);
   },
+  /** Die größten Bilder einer PDF (Scan-Apps speichern Seiten als JPEG) – für die Texterkennung. */
+  async images(u8, max = 3) {
+    const doc = await PdfText.load(u8);
+    const list = [];
+    for (const o of doc.objs.values()) {
+      const d = o.v && o.v.t === 'd' ? o.v.v : null;
+      if (!d || !o.raw || PdfText.name(PdfText.get(doc, d.Subtype)) !== 'Image') continue;
+      const w = PdfText.get(doc, d.Width) | 0, h = PdfText.get(doc, d.Height) | 0;
+      if (w >= 300 && h >= 300) list.push({ o, d, w, h });
+    }
+    list.sort((a, b) => b.w * b.h - a.w * a.h);
+    const out = [];
+    for (const it of list) {
+      if (out.length >= max) break;
+      let f = PdfText.get(doc, it.d.Filter);
+      f = !f ? [] : Array.isArray(f) ? f.map(x => PdfText.name(PdfText.get(doc, x))) : [PdfText.name(f)];
+      // Filterkette abarbeiten (z. B. ASCII85 + DCT/Flate, wie manche Programme speichern)
+      let data = it.o.raw, jpeg = false, ok = true;
+      for (let n = 0; n < f.length && ok; n++) {
+        const name = f[n];
+        if (name === 'ASCII85Decode' || name === 'A85') data = PdfText.ascii85(data);
+        else if (name === 'ASCIIHexDecode' || name === 'AHx') data = PdfText.asciiHex(data);
+        else if (name === 'FlateDecode' || name === 'Fl') { try { data = await PdfText.inflate(data, false); } catch (e) { try { data = await PdfText.inflate(data, true); } catch (e2) { ok = false; } } }
+        else if ((name === 'DCTDecode' || name === 'DCT') && n === f.length - 1) jpeg = true;
+        else ok = false;
+      }
+      if (!ok) continue;
+      if (jpeg) { out.push(new Blob([data], { type: 'image/jpeg' })); continue; }
+      if ((PdfText.get(doc, it.d.BitsPerComponent) | 0) === 8) {
+        const parms = PdfText.dict(doc, Array.isArray(PdfText.get(doc, it.d.DecodeParms)) ? null : it.d.DecodeParms);
+        if (parms && (PdfText.get(doc, parms.Predictor) | 0) > 1) continue; // selten bei Scans
+        const cs = PdfText.get(doc, it.d.ColorSpace);
+        const csn = PdfText.name(cs) || (Array.isArray(cs) ? PdfText.name(PdfText.get(doc, cs[0])) : null);
+        let comps = csn === 'DeviceRGB' ? 3 : csn === 'DeviceGray' ? 1 : 0;
+        if (csn === 'ICCBased' && Array.isArray(cs)) { const icc = PdfText.dict(doc, cs[1]); comps = icc ? PdfText.get(doc, icc.N) | 0 : 0; }
+        if (comps !== 1 && comps !== 3) continue;
+        const raw = data;
+        if (!raw || raw.length < it.w * it.h * comps) continue;
+        const c = document.createElement('canvas'); c.width = it.w; c.height = it.h;
+        const x = c.getContext('2d'), img = x.createImageData(it.w, it.h), dd = img.data;
+        for (let i = 0, j = 0; i < it.w * it.h; i++, j += comps) {
+          const k = i * 4;
+          if (comps === 3) { dd[k] = raw[j]; dd[k + 1] = raw[j + 1]; dd[k + 2] = raw[j + 2]; } else { dd[k] = dd[k + 1] = dd[k + 2] = raw[j]; }
+          dd[k + 3] = 255;
+        }
+        x.putImageData(img, 0, 0);
+        const b = await new Promise(r => c.toBlob(r, 'image/png'));
+        if (b) out.push(b);
+      }
+    }
+    return out;
+  },
   async extract(u8, maxPages = 5) {
     const doc = await PdfText.load(u8);
     const pages = [];
@@ -1876,13 +1946,13 @@ const ReceiptParser = {
       const m = /^([^,]{2,40}?)\s*,\s*[^,]*?\d+\s*[a-z]?\s*,\s*\d{5}\s+\S+/i.exec(line);
       if (m && /[a-zäöü]{2}/i.test(m[1]) && !/rechnung|kunde|datum|straße|str\./i.test(m[1])) return m[1].replace(/\s+(gmbh|ag|kg|ug|ohg|e\.\s?k\.)\b.*$/i, '').trim();
     }
+    // Internetadresse des Händlers, z. B. „www.is-racing.de“
+    const w = /\bwww\s?[.,]\s?([a-z0-9-]{3,40})(?:\s?[.,]\s?|\s)(de|com|at|ch|eu|net|shop)\b/i.exec(text);
+    if (w) return w[1].toLowerCase().split('-').map(x => x.charAt(0).toUpperCase() + x.slice(1)).join('-');
     for (const line of lines.slice(0, 8)) {
       const m = /^(.{2,60}?)\s+(gmbh|ag|kg|e\.\s?k\.|ohg|ug|se|ltd\.?|inc\.?)\b/i.exec(line.replace(/\s*&\s*co\.?\s*/i, ' '));
       if (m && /[a-zäöü]{2}/i.test(m[1]) && !/rechnung|kunde|datum/i.test(m[1])) return m[1].replace(/[,;:]+$/, '').trim();
     }
-    // Notlösung: Internetadresse des Händlers, z. B. „www.is-racing.de“
-    const w = /\bwww\.([a-z0-9-]{2,40})\.(de|com|at|ch|eu|net|shop)\b/i.exec(text);
-    if (w) return w[1].split('-').map(x => x.charAt(0).toUpperCase() + x.slice(1)).join('-');
     return null;
   },
 
@@ -1951,6 +2021,7 @@ const ReceiptParser = {
     const brandRe = ReceiptParser.brandRe();
     const amountOnly = l => /^[\s\dxX*.,'€EURurStk-]+$/.test(l) || /^\s*\d+\s*(x|stk\.?|st\.?)\s*[\d.,]+/i.test(l);
     const usable = line => line && !ReceiptParser.NOT_PRODUCT.test(line) && !/\b\d{5}\s+[A-ZÄÖÜ][a-zäöü]/.test(line)
+      && !ReceiptParser.dateMatches(line, today).length
       && !(retailer && line.toLowerCase().replace(/\s/g, '').includes(retailer.toLowerCase().replace(/\s/g, '')));
     const cands = [];
     lines.forEach((line, i) => {
@@ -1970,13 +2041,15 @@ const ReceiptParser = {
       const letters = (name.match(/[a-zäöüß]/gi) || []).length;
       if (letters < 4 || name.length > 90) return;
       let score = 0;
+      name = name.replace(/(?:\s+-?[\d.,]+){1,4}\s*$/, '').replace(/^\s*[A-Za-z]\s+(?=\S)/, '').trim();
+      const strong = brandRe.test(name) || !!ReceiptParser.typeOf(name);
       if (brandRe.test(name)) score += 6;
       if (ReceiptParser.typeOf(name)) score += 5;
       if (amts.length) score += 2;
       if (name.split(' ').some(ReceiptParser.isModelToken)) score += 2;
       if (totalLine != null && i > totalLine) score -= 4;
       if (/^[A-ZÄÖÜ\s]{3,}$/.test(name) && name.split(' ').length <= 2 && !brandRe.test(name)) score -= 2;
-      cands.push({ name, score, cents: amts.length ? Math.max(...amts.map(a => a.cents)) : 0, i });
+      cands.push({ name, score, strong, cents: amts.length ? Math.max(...amts.map(a => a.cents)) : 0, i });
     });
     if (!cands.length) return null;
     const maxC = Math.max(...cands.map(c => c.cents));
@@ -1996,11 +2069,12 @@ const ReceiptParser = {
     const total = ReceiptParser.findTotal(lines, today);
     if (total) { out.priceCents = total.cents; out.price = (total.cents / 100).toFixed(2).replace('.', ','); }
     out.serialNumber = ReceiptParser.findSerial(joined);
-    const found = ReceiptParser.findProduct(lines, today, total ? total.line : null, out.retailer);
+    let found = ReceiptParser.findProduct(lines, today, total ? total.line : null, out.retailer);
+    if (found && !found.strong && out.retailer) found = { name: 'Rechnung ' + out.retailer, strong: false, cents: 0 };
     let product = found ? found.name : null;
     let model = ReceiptParser.findModel(joined);
     // Mehrere Artikel auf der Rechnung: Für die Garantie zählt der Preis des Produkts, nicht die Gesamtsumme.
-    if (found && found.cents && total && found.cents < total.cents) { out.priceCents = found.cents; out.price = (found.cents / 100).toFixed(2).replace('.', ','); }
+    if (found && found.strong && found.cents && total && found.cents < total.cents) { out.priceCents = found.cents; out.price = (found.cents / 100).toFixed(2).replace('.', ','); }
     if (product) {
       product = ReceiptParser.prettify(product);
       const words = product.split(' ');
@@ -2086,32 +2160,95 @@ const TessOCR = {
       if (w) w.terminate().catch(() => {});
     }, TessOCR.IDLE_MS);
   },
-  /** Bild für die Erkennung aufbereiten: passende Größe, optional drehen, Graustufen, Kontrast strecken. */
+  /**
+   * Bild für die Erkennung aufbereiten (Fotos von Papierbelegen):
+   *  1. passende Größe, optional um 90°/270° drehen
+   *  2. Graustufen
+   *  3. Schräglage erkennen und gerade drehen (bis ±12°)
+   *  4. ungleichmäßiges Licht/Schatten ausgleichen: lokale Schwelle (Bradley) → klares Schwarz-Weiß
+   */
   async prepare(blob, rotate) {
     const bmp = await createImageBitmap(blob);
     const m = Math.max(bmp.width, bmp.height);
-    const sc = Math.min(2200 / m, Math.max(1, 1400 / m));
+    const sc = Math.min(2400 / m, Math.max(1, 1600 / m));
     const w = Math.max(1, Math.round(bmp.width * sc)), h = Math.max(1, Math.round(bmp.height * sc));
     const turned = rotate % 180 !== 0;
-    const c = document.createElement('canvas');
-    c.width = turned ? h : w; c.height = turned ? w : h;
-    const x = c.getContext('2d', { willReadFrequently: true });
-    x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height);
-    x.translate(c.width / 2, c.height / 2); x.rotate(rotate * Math.PI / 180);
-    x.drawImage(bmp, -w / 2, -h / 2, w, h);
+    const draw = (deg, cw, ch) => {
+      const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+      const x = c.getContext('2d', { willReadFrequently: true });
+      x.fillStyle = '#fff'; x.fillRect(0, 0, cw, ch);
+      x.translate(cw / 2, ch / 2); x.rotate(deg * Math.PI / 180);
+      x.drawImage(bmp, -w / 2, -h / 2, w, h);
+      return { c, x };
+    };
+    const gray = (x, cw, ch) => {
+      const d = x.getImageData(0, 0, cw, ch).data, g = new Uint8ClampedArray(cw * ch);
+      for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000;
+      return g;
+    };
+    let cw = turned ? h : w, ch = turned ? w : h;
+    let { c, x } = draw(rotate, cw, ch);
+    let g = gray(x, cw, ch);
+    // Schräglage: Projektionsprofil der Schriftpixel auf einer verkleinerten, lokal binarisierten Kopie
+    const skew = TessOCR.skewAngle(g, cw, ch);
+    if (Math.abs(skew) >= 0.4) {
+      const r = Math.abs(skew) * Math.PI / 180;
+      const nw = Math.ceil(cw * Math.cos(r) + ch * Math.sin(r)), nh = Math.ceil(ch * Math.cos(r) + cw * Math.sin(r));
+      ({ c, x } = draw(rotate - skew, nw, nh));
+      cw = nw; ch = nh; g = gray(x, cw, ch);
+    }
+    const out = TessOCR.binarize(g, cw, ch);
+    const img = x.createImageData(cw, ch), d = img.data;
+    for (let i = 0, j = 0; j < out.length; i += 4, j++) { d[i] = d[i + 1] = d[i + 2] = out[j]; d[i + 3] = 255; }
+    x.setTransform(1, 0, 0, 1, 0, 0); x.putImageData(img, 0, 0);
     if (bmp.close) bmp.close();
-    const img = x.getImageData(0, 0, c.width, c.height), d = img.data, hist = new Uint32Array(256);
-    for (let i = 0; i < d.length; i += 4) { const g = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000 | 0; d[i] = g; hist[g]++; }
-    const n = d.length / 4;
-    let lo = 0, hi = 255, acc = 0;
-    for (; lo < 254; lo++) { acc += hist[lo]; if (acc > n * 0.01) break; }
-    acc = 0;
-    for (; hi > lo + 1; hi--) { acc += hist[hi]; if (acc > n * 0.01) break; }
-    const range = Math.max(24, hi - lo);
-    for (let i = 0; i < d.length; i += 4) { let v = (d[i] - lo) * 255 / range; v = v < 0 ? 0 : v > 255 ? 255 : v; d[i] = d[i + 1] = d[i + 2] = v; }
-    x.putImageData(img, 0, 0);
-    const out = await new Promise(r => c.toBlob(r, 'image/png'));
-    return { blob: out, landscape: c.width > c.height * 1.15 };
+    const blobOut = await new Promise(r2 => c.toBlob(r2, 'image/png'));
+    return { blob: blobOut, landscape: cw > ch * 1.15, skew };
+  },
+  /** Schräglage in Grad (positiv = im Uhrzeigersinn gedreht). */
+  skewAngle(g, w, h) {
+    const step = Math.max(1, Math.round(Math.max(w, h) / 1000));
+    const sw = Math.floor(w / step), sh = Math.floor(h / step), small = new Uint8ClampedArray(sw * sh);
+    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) small[y * sw + xx] = g[(y * step) * w + xx * step];
+    const bin = TessOCR.binarize(small, sw, sh); // dunkle Flächen (Tisch, Schatten) werden weiß, Schrift schwarz
+    const pts = [];
+    const mx = Math.round(sw * 0.02), my = Math.round(sh * 0.02);
+    for (let y = my; y < sh - my; y++) for (let xx = mx; xx < sw - mx; xx++) if (bin[y * sw + xx] === 0) pts.push(xx, y);
+    if (pts.length < 400) return 0;
+    const n = pts.length / 2, stride = n > 80000 ? Math.ceil(n / 80000) : 1, off = sw + sh;
+    const score = deg => {
+      const a = deg * Math.PI / 180, si = Math.sin(a), co = Math.cos(a), hist = new Float64Array(2 * off + 2);
+      for (let k = 0; k < pts.length; k += 2 * stride) {
+        const yy = Math.round(pts[k + 1] * co - pts[k] * si) + off;
+        hist[yy]++;
+      }
+      let sc = 0; for (let i = 0; i < hist.length; i++) sc += hist[i] * hist[i]; return sc;
+    };
+    let best = 0, bestS = -1;
+    for (let deg = -12; deg <= 12; deg += 1) { const s1 = score(deg); if (s1 > bestS) { bestS = s1; best = deg; } }
+    const c0 = best;
+    for (let deg = c0 - 0.9; deg <= c0 + 0.91; deg += 0.15) { const s1 = score(deg); if (s1 > bestS) { bestS = s1; best = deg; } }
+    return Math.round(best * 100) / 100;
+  },
+  /** Lokale Schwelle nach Bradley/Roth mit Integralbild: gleicht Schatten und Licht aus. */
+  binarize(g, w, h) {
+    const S = Math.max(15, Math.round(Math.max(w, h) / 22)), half = S >> 1, T = 0.15;
+    const I = new Uint32Array((w + 1) * (h + 1));
+    for (let y = 1; y <= h; y++) {
+      let row = 0;
+      for (let xx = 1; xx <= w; xx++) { row += g[(y - 1) * w + xx - 1]; I[y * (w + 1) + xx] = I[(y - 1) * (w + 1) + xx] + row; }
+    }
+    const out = new Uint8ClampedArray(w * h);
+    for (let y = 0; y < h; y++) {
+      const y1 = Math.max(0, y - half), y2 = Math.min(h - 1, y + half);
+      for (let xx = 0; xx < w; xx++) {
+        const x1 = Math.max(0, xx - half), x2 = Math.min(w - 1, xx + half);
+        const count = (x2 - x1 + 1) * (y2 - y1 + 1);
+        const s = I[(y2 + 1) * (w + 1) + x2 + 1] - I[y1 * (w + 1) + x2 + 1] - I[(y2 + 1) * (w + 1) + x1] + I[y1 * (w + 1) + x1];
+        out[y * w + xx] = g[y * w + xx] * count <= s * (1 - T) ? 0 : 255;
+      }
+    }
+    return out;
   },
   async recognize(blob, progress) {
     if (!(await TessOCR.probe())) return null;
@@ -2213,8 +2350,20 @@ const Scan = {
       renderFormReceipt('Rechnung wird gelesen …');
       try {
         if (prep.type === 'application/pdf') {
-          text = await PdfText.extract(new Uint8Array(await prep.blob.arrayBuffer()));
-          if (!text.replace(/\s/g, '')) problem = 'pdf-no-text';
+          const u8 = new Uint8Array(await prep.blob.arrayBuffer());
+          text = await PdfText.extract(u8);
+          if (!text.replace(/\s/g, '')) {
+            // Gescannte PDF (z. B. aus Google Drive oder der Samsung-Kamera): Seitenbilder mit der Texterkennung lesen
+            await TessOCR.probe();
+            if (TextRecognition.imageAvailable()) {
+              const imgs = await PdfText.images(u8, 2).catch(() => []);
+              for (const img of imgs) {
+                const t = await TextRecognition.fromImage(img, (tt, pp) => { if (App.form === F) renderFormReceipt(tt + (typeof pp === 'number' && pp > 0 ? ' ' + Math.round(pp * 100) + ' %' : '')); });
+                if (t) text += '\n' + t;
+              }
+            }
+            if (!text.replace(/\s/g, '')) problem = 'pdf-no-text';
+          }
         } else if ((await TessOCR.probe(), TextRecognition.imageAvailable())) {
           text = await TextRecognition.fromImage(prep.blob, (t, p) => { if (App.form === F) renderFormReceipt(t + (typeof p === 'number' && p > 0 ? ' ' + Math.round(p * 100) + ' %' : '')); });
           if (!text || !text.replace(/\s/g, '')) problem = 'ocr-empty';
@@ -3128,6 +3277,117 @@ const Notify = {
   }
 };
 
+/* ===================== 6h. LIVE-SCANNER ===================== */
+/**
+ * Rechnung direkt in der App scannen: Kamera-Vorschau mit Rahmen, automatische Aufnahme,
+ * sobald das Bild ruhig, scharf und hell genug ist (manueller Auslöser und Taschenlampe zusätzlich).
+ * Nur über https:// (GitHub Pages / installierte App) – in der heruntergeladenen HTML-Datei bleibt es beim Hochladen.
+ */
+const LiveScan = {
+  available() {
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && window.isSecureContext !== false && /^https?:$/.test(location.protocol);
+  },
+  open() {
+    return new Promise(async resolve => {
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1920 } } });
+      } catch (e) {
+        UI.toast(e && e.name === 'NotAllowedError'
+          ? 'Kamera-Zugriff wurde nicht erlaubt. Du kannst die Rechnung stattdessen als Foto oder PDF hochladen.'
+          : 'Die Kamera konnte nicht gestartet werden. Lade die Rechnung stattdessen als Foto oder PDF hoch.', 'error', 6000);
+        resolve(null); return;
+      }
+      const el = document.createElement('div');
+      el.className = 'scanner';
+      el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', 'Rechnung scannen');
+      el.innerHTML = `<video playsinline autoplay muted></video>
+        <div class="scan-frame" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <div class="scan-top">
+          <button class="scan-btn" type="button" data-scan="close" aria-label="Schließen">${ICON.close || '✕'}</button>
+          <button class="scan-btn" type="button" data-scan="torch" aria-label="Licht" hidden>${ICON.torch}</button>
+        </div>
+        <div class="scan-bottom">
+          <p class="scan-msg" aria-live="polite">Halte die Rechnung in den Rahmen</p>
+          <button class="scan-shutter" type="button" data-scan="shot" aria-label="Jetzt aufnehmen"></button>
+          <p class="scan-sub">Wird automatisch aufgenommen, sobald das Bild ruhig und scharf ist</p>
+        </div>`;
+      const video = el.querySelector('video');
+      video.srcObject = stream;
+      const track = stream.getVideoTracks()[0];
+      let done = false, result = null, timer = null, torchOn = false;
+      const stop = () => { clearInterval(timer); document.removeEventListener('visibilitychange', onHide); stream.getTracks().forEach(t => t.stop()); };
+      const onHide = () => { if (document.hidden && !done) { done = true; Overlay.closeTop(); } };
+      document.addEventListener('visibilitychange', onHide);
+      Overlay.open(el, () => { done = true; stop(); resolve(result); });
+      // Schließen sofort bedienbar machen, noch bevor die Kamera läuft
+      el.querySelector('[data-scan="close"]').onclick = () => { done = true; Overlay.closeTop(); };
+      try { await video.play(); } catch (e) { /* Autoplay: läuft trotzdem an */ }
+      if (done) return;
+      try {
+        const caps = track.getCapabilities ? track.getCapabilities() : {};
+        if (caps && caps.torch) {
+          const tb = el.querySelector('[data-scan="torch"]'); tb.hidden = false;
+          tb.onclick = async () => { torchOn = !torchOn; try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); tb.classList.toggle('on', torchOn); } catch (e) { torchOn = !torchOn; } };
+        }
+      } catch (e) { /* kein Licht verfügbar */ }
+      const msg = el.querySelector('.scan-msg'), sub = el.querySelector('.scan-sub');
+      const capture = async () => {
+        if (done) return;
+        done = true; clearInterval(timer);
+        el.classList.add('flash');
+        msg.textContent = 'Aufgenommen';
+        let blob = null;
+        try { if ('ImageCapture' in window) blob = await new ImageCapture(track).takePhoto(); } catch (e) { blob = null; }
+        if (!blob || !blob.size) {
+          const c = document.createElement('canvas');
+          c.width = video.videoWidth || 1280; c.height = video.videoHeight || 720;
+          c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+          blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+        }
+        result = blob && blob.size ? new File([blob], `Rechnung-${App.today}.jpg`, { type: blob.type || 'image/jpeg' }) : null;
+        Overlay.closeTop();
+      };
+      el.querySelector('[data-scan="shot"]').onclick = capture;
+      // Automatische Aufnahme: kleine Kopie des Kamerabilds auf Ruhe, Schärfe und Helligkeit prüfen
+      const W = 160, H = 120, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+      const cx = cv.getContext('2d', { willReadFrequently: true });
+      let prev = null, steady = 0, maxSharp = 0;
+      const startAt = Date.now();
+      timer = setInterval(() => {
+        if (done || video.readyState < 2) return;
+        cx.drawImage(video, 0, 0, W, H);
+        const d = cx.getImageData(0, 0, W, H).data, g = new Float32Array(W * H);
+        let bright = 0;
+        for (let i = 0, j = 0; i < d.length; i += 4, j++) { g[j] = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114; bright += g[j]; }
+        bright /= g.length;
+        let s1 = 0, s2 = 0, n = 0;
+        for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+          const k = y * W + x, l = 4 * g[k] - g[k - 1] - g[k + 1] - g[k - W] - g[k + W];
+          s1 += l; s2 += l * l; n++;
+        }
+        const sharp = s2 / n - (s1 / n) * (s1 / n);
+        let motion = 99;
+        if (prev) { motion = 0; for (let k = 0; k < g.length; k++) motion += Math.abs(g[k] - prev[k]); motion /= g.length; }
+        prev = g;
+        maxSharp = Math.max(maxSharp, sharp);
+        const warm = Date.now() - startAt > 1200;
+        const sharpOk = sharp > Math.max(40, maxSharp * 0.65);
+        let text;
+        if (bright < 45) text = 'Zu dunkel – mehr Licht oder Taschenlampe';
+        else if (bright > 240) text = 'Zu hell – Spiegelung vermeiden';
+        else if (motion > 5) text = 'Halte das Handy ruhig';
+        else if (!sharpOk) text = 'Etwas näher heran, bis die Schrift scharf ist';
+        else text = 'Gleich wird aufgenommen …';
+        msg.textContent = text;
+        steady = warm && bright >= 45 && bright <= 240 && motion <= 5 && sharpOk ? steady + 1 : 0;
+        if (Date.now() - startAt > 8000) sub.textContent = 'Klappt es nicht automatisch? Tippe auf den Auslöser.';
+        if (steady >= 4) capture();
+      }, 250);
+    });
+  }
+};
+
 /* ===================== 7. UI-BAUSTEINE ===================== */
 /**
  * Overlays (Bottom-Sheets, Belegansicht) legen einen History-Eintrag an.
@@ -3290,6 +3550,8 @@ async function openReceiptViewer(meta) {
 
 /* ===================== 8. ANSICHTEN ===================== */
 const ICON = {
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  torch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3h10v4l-3 4v10h-4V11L7 7z"/><path d="M12 14v2"/></svg>',
   gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
   more: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>',
   calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>',
@@ -3593,7 +3855,9 @@ function viewForm(mode, src) {
         <h2 class="form-section-title">Rechnung</h2>
         <p class="hint" id="scan-hint">${TextRecognition.hint()}</p>
       </div></div>
-      <button class="btn btn-primary btn-block" type="button" data-action="form-pick" data-kind="file">${ico('upload')}${p.receipt && mode === 'edit' ? 'Andere Rechnung hochladen' : 'Rechnung hochladen'}</button>
+      ${LiveScan.available() ? `<button class="btn btn-primary btn-block" type="button" data-action="live-scan">${ico('scan')}${p.receipt && mode === 'edit' ? 'Andere Rechnung scannen' : 'Rechnung scannen'}</button>
+      <button class="btn btn-secondary btn-block" type="button" data-action="form-pick" data-kind="file">${ico('upload')}Foto oder PDF hochladen</button>`
+      : `<button class="btn btn-primary btn-block" type="button" data-action="form-pick" data-kind="file">${ico('upload')}${p.receipt && mode === 'edit' ? 'Andere Rechnung hochladen' : 'Rechnung hochladen'}</button>`}
       <div id="form-receipt"></div>
       <div id="scan-result" aria-live="polite"></div>
     </section>
@@ -3988,7 +4252,7 @@ ${Cloud.enabled() ? `<h2>Cloud-Sicherung (freiwillig)</h2>
 <p>Rechnungen werden direkt auf deinem Gerät ausgelesen. Fotos und PDFs werden dafür nicht hochgeladen. Die Programmdateien der Texterkennung werden beim ersten Gebrauch einmalig vom selben Server geladen wie die App selbst (siehe Abschnitt 7). Kopierst du Text aus einer anderen App hinein, z. B. aus Google Lens, gelten für das Erkennen die Bestimmungen dieses Anbieters.</p>
 
 <h2>5. Kamera, Dateien und Downloads</h2>
-<p>Die App greift nur auf Kamera oder Dateien zu, wenn du selbst eine Rechnung hochlädst. Die Auswahl erfolgt über das Android-System. Backups, PDF-Exporte und Kalenderdateien erstellst du selbst; sie werden dort gespeichert, wo du es wählst, meist im Ordner „Download“. Backup-Dateien sind nicht verschlüsselt: Wer die Datei hat, kann die Einträge sehen. Bewahre sie daher sicher auf. Speicherst du sie bei einem Cloud-Dienst wie Google Drive, gelten dessen Bestimmungen.</p>
+<p>Die App greift nur auf Kamera oder Dateien zu, wenn du selbst eine Rechnung scannst oder hochlädst. Beim Scannen wird das Kamerabild nur auf dem Gerät ausgewertet; gespeichert wird allein das aufgenommene Foto als Rechnung. Die Kamera-Erlaubnis kannst du jederzeit in den Android-Einstellungen widerrufen. Backups, PDF-Exporte und Kalenderdateien erstellst du selbst; sie werden dort gespeichert, wo du es wählst, meist im Ordner „Download“. Backup-Dateien sind nicht verschlüsselt: Wer die Datei hat, kann die Einträge sehen. Bewahre sie daher sicher auf. Speicherst du sie bei einem Cloud-Dienst wie Google Drive, gelten dessen Bestimmungen.</p>
 
 <h2>6. Benachrichtigungen</h2>
 <p>Wenn du Benachrichtigungen erlaubst, prüft die App regelmäßig auf deinem Gerät, ob eine Garantie bald abläuft, und zeigt dann eine Benachrichtigung an. Dafür werden keine Daten an einen Server gesendet. Rechtsgrundlage ist deine Einwilligung (Art. 6 Abs. 1 lit. a DSGVO), die du jederzeit in der App oder in den Android-Einstellungen widerrufen kannst.</p>
@@ -4179,6 +4443,12 @@ const Actions = {
   },
   'form-pick': el => { Draft.saveNow(); formPick(el.dataset.kind); },
   'scan-undo': () => Scan.undo(),
+  'live-scan': async () => {
+    const F = App.form; if (!F || F.busy) return;
+    Draft.saveNow();
+    const file = await LiveScan.open();
+    if (file && App.form === F) await Scan.upload(F, file);
+  },
   'scan-paste': () => Scan.paste(),
   'pdf-export': () => PdfReport.askAndExport(),
   'notify-toggle': async () => { if (Notify.on()) { await Notify.disable(); UI.toast('Benachrichtigungen ausgeschaltet'); } else if (await Notify.enable()) UI.toast('Benachrichtigungen sind aktiv.'); renderView(); },
