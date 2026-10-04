@@ -1871,17 +1871,27 @@ const ReceiptParser = {
       if (m && (!best || m.index < best.index)) best = { name, index: m.index };
     }
     if (best) return best.name;
+    // Absenderzeile über der Anschrift, z. B. „IS-RACING, Im Kröpsch 3a, 53940 Hellenthal“
+    for (const line of lines.slice(0, 14)) {
+      const m = /^([^,]{2,40}?)\s*,\s*[^,]*?\d+\s*[a-z]?\s*,\s*\d{5}\s+\S+/i.exec(line);
+      if (m && /[a-zäöü]{2}/i.test(m[1]) && !/rechnung|kunde|datum|straße|str\./i.test(m[1])) return m[1].replace(/\s+(gmbh|ag|kg|ug|ohg|e\.\s?k\.)\b.*$/i, '').trim();
+    }
     for (const line of lines.slice(0, 8)) {
       const m = /^(.{2,60}?)\s+(gmbh|ag|kg|e\.\s?k\.|ohg|ug|se|ltd\.?|inc\.?)\b/i.exec(line.replace(/\s*&\s*co\.?\s*/i, ' '));
       if (m && /[a-zäöü]{2}/i.test(m[1]) && !/rechnung|kunde|datum/i.test(m[1])) return m[1].replace(/[,;:]+$/, '').trim();
     }
+    // Notlösung: Internetadresse des Händlers, z. B. „www.is-racing.de“
+    const w = /\bwww\.([a-z0-9-]{2,40})\.(de|com|at|ch|eu|net|shop)\b/i.exec(text);
+    if (w) return w[1].split('-').map(x => x.charAt(0).toUpperCase() + x.slice(1)).join('-');
     return null;
   },
 
   /* ---------- Serien- und Modellnummer ---------- */
   findSerial(text) {
     const m = /(?:\bs\/?n\b|seriennummer|serien-?nr\.?|serial\s*(?:no\.?|number)?)\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-\/]{4,39})/i.exec(text)
-      || /\bimei\s*(?:1)?\s*[:#]?\s*(\d{15})\b/i.exec(text);
+      || /\bimei\s*(?:1)?\s*[:#]?\s*(\d{15})\b/i.exec(text)
+      || /\b(?:fin|vin|fahrgestell(?:nummer|-?nr\.?)?)\s*[:#.]?\s*([A-HJ-NPR-Z0-9]{17})\b/i.exec(text)
+      || /\b((?=[A-HJ-NPR-Z0-9]{17}\b)(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-HJ-NPR-Z])[A-HJ-NPR-Z0-9]{17})\b/.exec(text); // Fahrzeug-Identnummer (FIN)
     return m ? m[1].toUpperCase() : null;
   },
   findModel(text) {
@@ -1889,6 +1899,7 @@ const ReceiptParser = {
     return m ? m[1].toUpperCase().replace(/[.\-\/]+$/, '') : null;
   },
   isModelToken(t) {
+    if (/^[A-HJ-NPR-Z0-9]{17}$/i.test(t) && /\d/.test(t) && /[a-z]/i.test(t)) return false; // FIN gehört zur Seriennummer
     return t.length >= 6 && t.length <= 24 && /^[A-Z0-9][A-Z0-9\-\/]*$/i.test(t) && (t.match(/\d/g) || []).length >= 2
       && (t.match(/[A-Z]/gi) || []).length >= 2 && !/^\d+(gb|tb|mb|mah|wh|kw|w|v|l|kg|cm|mm|zoll|hz|u\/min|upm)$/i.test(t)
       && !/^\d{6,}$/.test(t);
@@ -2000,6 +2011,7 @@ const ReceiptParser = {
         const rest = words.filter(w => w.toUpperCase() !== model).join(' ').trim();
         if ((rest.match(/[a-zäöüß]/gi) || []).length >= 6) product = rest;
       }
+      if (out.serialNumber) product = product.split(' ').filter(w => w.toUpperCase() !== out.serialNumber).join(' ').trim();
       out.name = product.slice(0, 200);
     }
     out.modelNumber = model && model !== out.serialNumber ? model : null;
