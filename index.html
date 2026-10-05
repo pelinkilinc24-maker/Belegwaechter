@@ -1046,53 +1046,34 @@ const Receipts = {
  * Beide Dateien können über "Importieren" und "Backup wiederherstellen" eingelesen werden.
  */
 /**
- * Optionale Verschlüsselung für Backups (Web Crypto, im Browser eingebaut, offline).
- * Passwort → PBKDF2-SHA-256 (600.000 Runden, 16 Byte Salt) → AES-256-GCM (12 Byte IV).
- * GCM erkennt falsche Passwörter und veränderte Dateien zuverlässig. Ohne Passwort gibt es keinen Zugriff,
- * auch nicht durch die App: Ein vergessenes Passwort kann nicht zurückgesetzt werden.
- * Web Crypto steht nur in sicheren Kontexten zur Verfügung (https://, localhost, in Chrome auch file://, Android-WebView-Assets).
+ * Nur zum Öffnen älterer, mit Passwort geschützter Backups (Versionen vor 2.7.1).
+ * Neue Backups werden ohne Verschlüsselung erstellt.
+ * Format alter Dateien: PBKDF2-SHA-256 → AES-256-GCM (Web Crypto, offline).
  */
-const BackupCrypto = {
-  ITERATIONS: 600000,
-  MIN_PASSWORD: 8,
-  available() { return !!(window.isSecureContext !== false && window.crypto && crypto.subtle && crypto.getRandomValues); },
-  toB64(buf) {
-    const bytes = new Uint8Array(buf), parts = [];
-    for (let i = 0; i < bytes.length; i += 0x8000) parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
-    return btoa(parts.join(''));
-  },
+/**
+ * Backups älterer Versionen, die mit Passwort verschlüsselt wurden (PBKDF2-SHA-256 + AES-256-GCM),
+ * können weiterhin geöffnet werden. Neue Backups werden nicht verschlüsselt.
+ */
+const LegacyBackup = {
+  available() { return !!(window.isSecureContext !== false && window.crypto && crypto.subtle); },
+  isEncrypted(obj) { return !!(obj && typeof obj === 'object' && APP_IDS.includes(obj.app) && obj.kind === 'backup-encrypted'); },
   fromB64(str) {
     const bin = atob(str), out = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
   },
-  async deriveKey(password, salt, iterations) {
-    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
-    return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-  },
-  async encrypt(text, password) {
-    const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await BackupCrypto.deriveKey(password, salt, BackupCrypto.ITERATIONS);
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text));
-    return {
-      app: APP_NAME, kind: 'backup-encrypted', version: 1, createdAt: new Date().toISOString(),
-      cipher: 'AES-256-GCM', kdf: { name: 'PBKDF2', hash: 'SHA-256', iterations: BackupCrypto.ITERATIONS, salt: BackupCrypto.toB64(salt) },
-      iv: BackupCrypto.toB64(iv), data: BackupCrypto.toB64(ct)
-    };
-  },
-  isEncrypted(obj) { return !!(obj && typeof obj === 'object' && APP_IDS.includes(obj.app) && obj.kind === 'backup-encrypted'); },
   async decrypt(obj, password) {
-    if (!BackupCrypto.available()) throw new UserError('Verschlüsselte Backups können auf diesem Gerät nicht geöffnet werden.');
-    const k = obj.kdf || {};
-    const iterations = Number(k.iterations);
+    if (!LegacyBackup.available()) throw new UserError('Passwortgeschützte Backups können auf diesem Gerät nicht geöffnet werden.');
+    const k = obj.kdf || {}, iterations = Number(k.iterations);
     if (obj.cipher !== 'AES-256-GCM' || k.name !== 'PBKDF2' || k.hash !== 'SHA-256' || !Number.isInteger(iterations) || iterations < 100000 || iterations > 10000000
         || typeof k.salt !== 'string' || typeof obj.iv !== 'string' || typeof obj.data !== 'string') {
-      throw new UserError('Das Backup ist beschädigt.');
+      throw new UserError('Die Backup-Datei ist beschädigt.');
     }
     let salt, iv, data;
-    try { salt = BackupCrypto.fromB64(k.salt); iv = BackupCrypto.fromB64(obj.iv); data = BackupCrypto.fromB64(obj.data); }
-    catch (e) { throw new UserError('Das verschlüsselte Backup ist beschädigt.'); }
-    const key = await BackupCrypto.deriveKey(password, salt, iterations);
+    try { salt = LegacyBackup.fromB64(k.salt); iv = LegacyBackup.fromB64(obj.iv); data = LegacyBackup.fromB64(obj.data); }
+    catch (e) { throw new UserError('Die Backup-Datei ist beschädigt.'); }
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
     let plain;
     try { plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data); }
     catch (e) { throw new UserError('Falsches Passwort oder beschädigte Datei.'); }
@@ -1101,9 +1082,20 @@ const BackupCrypto = {
 };
 
 const Backup = {
+  FORMAT_VERSION: 2,
+  /** SHA-256 über Produkte und Rechnungen – erkennt beim Wiederherstellen beschädigte oder unvollständige Dateien. */
+  async checksum(products, receipts) {
+    if (!(window.crypto && crypto.subtle && crypto.subtle.digest)) return null;
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({ products, receipts })));
+    return 'sha256:' + Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+  },
+  fileName(date = new Date()) {
+    const p = n => String(n).padStart(2, '0');
+    return `belegwaechter-backup-${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}-${p(date.getHours())}${p(date.getMinutes())}.json`;
+  },
   async build(withReceipts) {
     const products = App.products.map(p => ({ ...p, receipt: withReceipts ? p.receipt : null }));
-    const out = { app: APP_NAME, kind: withReceipts ? 'backup' : 'export', version: 1, createdAt: new Date().toISOString(), products, receipts: [] };
+    const out = { app: APP_NAME, kind: withReceipts ? 'backup' : 'export', version: Backup.FORMAT_VERSION, appVersion: APP_VERSION, createdAt: new Date().toISOString(), counts: null, checksum: null, products, receipts: [] };
     if (withReceipts) {
       const used = new Set(products.filter(p => p.receipt).map(p => p.receipt.id));
       for (const r of await Store.getAllReceipts()) {
@@ -1111,20 +1103,20 @@ const Backup = {
         out.receipts.push({ id: r.id, productId: r.productId, name: r.name, type: r.type, size: r.size, addedAt: r.addedAt, dataUrl: await Receipts.blobToDataURL(r.blob) });
       }
     }
+    out.counts = { products: out.products.length, receipts: out.receipts.length };
+    out.checksum = await Backup.checksum(out.products, out.receipts);
     return out;
   },
   async download(withReceipts) {
     if (!App.products.length) { UI.toast('Es sind noch keine Produkte gespeichert.'); return; }
-    let password = '';
-    UI.toast(withReceipts ? (password ? 'Backup wird verschlüsselt …' : 'Backup wird erstellt …') : 'Export wird erstellt …');
+    UI.toast(withReceipts ? 'Backup wird erstellt …' : 'Export wird erstellt …');
     try {
-      let data = await Backup.build(withReceipts);
-      if (password) data = await BackupCrypto.encrypt(JSON.stringify(data), password);
+      const data = await Backup.build(withReceipts);
       const blob = new Blob([JSON.stringify(data, null, withReceipts ? 0 : 2)], { type: 'application/json' });
-      const file = 'belegwaechter-' + (withReceipts ? (password ? 'backup-verschluesselt' : 'backup') : 'export') + '-' + App.today + '.json';
+      const file = withReceipts ? Backup.fileName() : 'belegwaechter-export-' + App.today + '.json';
       downloadBlob(blob, file);
-      if (withReceipts) { Prefs.set('lastBackup', new Date().toISOString()); Prefs.set('lastBackupFile', file); }
-      UI.toast((withReceipts ? 'Backup' : 'Export') + ' heruntergeladen');
+      if (withReceipts) { Prefs.set('lastBackup', data.createdAt); Prefs.set('lastBackupFile', file); Prefs.set('lastBackupCount', data.counts.products); }
+      UI.toast(withReceipts ? `Backup gespeichert: ${file}` : 'Export heruntergeladen', 'info', withReceipts ? 5000 : 0);
       if (App.route.view === 'settings') renderView();
     } catch (e) {
       console.error(e);
@@ -1132,12 +1124,18 @@ const Backup = {
     }
   },
   /** Liest und prüft eine Importdatei. Fehlerhafte Einträge werden gezählt und übersprungen. */
+  /** Prüft Prüfsumme (ab Format 2) und Mengenangaben. */
+  async verify(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data) || !data.checksum) return;
+    const sum = await Backup.checksum(data.products, data.receipts || []);
+    if (sum && sum !== data.checksum) throw new UserError('Die Backup-Datei ist beschädigt oder unvollständig. Bitte verwende eine andere Sicherung.');
+  },
   parse(input) {
     let data = input;
     if (typeof input === 'string') {
       try { data = JSON.parse(input); } catch (e) { throw new UserError('Diese Datei kann nicht gelesen werden.'); }
     }
-    if (BackupCrypto.isEncrypted(data)) throw new UserError('Das Backup ist verschlüsselt.');
+    if (LegacyBackup.isEncrypted(data)) throw new UserError('Das Backup ist verschlüsselt.');
     const isObj = data && typeof data === 'object' && !Array.isArray(data);
     if (isObj && data.app && !APP_IDS.includes(data.app)) throw new UserError('Die Datei stammt nicht von Belegwächter.');
     const arr = Array.isArray(data) ? data : (isObj && Array.isArray(data.products) ? data.products : null);
@@ -1169,7 +1167,8 @@ const Backup = {
       } else p.receipt = null;
       products.push(p);
     }
-    return { products, receipts, skipped };
+    const meta = isObj ? { createdAt: typeof data.createdAt === 'string' ? data.createdAt : null, appVersion: typeof data.appVersion === 'string' ? data.appVersion : null } : {};
+    return { products, receipts, skipped, meta };
   },
   /** Übernimmt geprüfte Daten. "add" überspringt identische Einträge und vergibt bei Kollisionen neue IDs. */
   async apply(parsed, mode) {
@@ -1207,11 +1206,11 @@ const Backup = {
       const text = file.text ? await file.text() : await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsText(file); });
       let obj;
       try { obj = JSON.parse(text); } catch (e) { throw new UserError('Diese Datei kann nicht gelesen werden.'); }
-      if (BackupCrypto.isEncrypted(obj)) {
-        if (!BackupCrypto.available()) throw new UserError('Verschlüsselte Backups können auf diesem Gerät nicht geöffnet werden.');
+      if (LegacyBackup.isEncrypted(obj)) {
+        if (!LegacyBackup.available()) throw new UserError('Verschlüsselte Backups können auf diesem Gerät nicht geöffnet werden.');
         const res = await UI.modal({
-          title: 'Verschlüsseltes Backup',
-          html: `<p>Gib das Passwort dieses Backups ein.</p>
+          title: 'Passwortgeschütztes Backup',
+          html: `<p>Dieses Backup wurde mit einer älteren Version mit Passwort gesichert. Gib das Passwort ein, um es zu öffnen.</p>
             <div class="field"><label for="bk-pw">Passwort</label><input class="input" id="bk-pw" type="password" autocomplete="current-password"></div>`,
           actions: [
             { label: 'Entschlüsseln', value: 'ok', kind: 'primary', busy: 'Wird entschlüsselt …' },
@@ -1220,13 +1219,14 @@ const Backup = {
           check: async (value, el) => {
             const pw = el.querySelector('#bk-pw').value;
             if (!pw) return { error: 'Bitte gib das Passwort ein.' };
-            const plain = await BackupCrypto.decrypt(obj, pw);
+            const plain = await LegacyBackup.decrypt(obj, pw);
             try { return { data: JSON.parse(plain) }; } catch (e) { return { error: 'Der entschlüsselte Inhalt ist beschädigt.' }; }
           }
         });
         if (!res.value) return;
         obj = res.data;
       }
+      await Backup.verify(obj);
       parsed = Backup.parse(obj);
     } catch (e) {
       UI.toast(e instanceof UserError ? e.message : 'Die Datei konnte nicht gelesen werden.', 'error');
@@ -1240,6 +1240,7 @@ const Backup = {
     const choice = await UI.modal({
       title,
       html: `<div class="notice notice-warn">Der Import kann vorhandene Daten überschreiben.</div>
+        ${parsed.meta && parsed.meta.createdAt && !isNaN(new Date(parsed.meta.createdAt)) ? `<p class="small muted">Sicherung vom ${esc(new Date(parsed.meta.createdAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }))} Uhr</p>` : ''}
         <p>Gefunden: <strong>${n} ${plural(n, 'Produkt', 'Produkte')}</strong>${r ? ` und <strong>${r} ${plural(r, 'Rechnung', 'Rechnungen')}</strong>` : ', keine Rechnungsdateien'}.${parsed.skipped ? ` ${parsed.skipped} fehlerhafte ${plural(parsed.skipped, 'Eintrag wird', 'Einträge werden')} übersprungen.` : ''}</p>
         <p class="small"><strong>Ersetzen:</strong> Deine aktuellen Daten werden gelöscht und durch die Datei ersetzt.</p>
         <p class="small"><strong>Hinzufügen:</strong> Die Einträge aus der Datei kommen dazu, doppelte werden übersprungen.</p>`,
@@ -4204,6 +4205,7 @@ function viewSettings() {
     <section class="section"><h2 class="form-section-title">Datensicherung</h2>
       <div class="card stack">
         <div class="kv" style="padding:0"><span class="muted">Letztes Backup</span><strong>${esc(lastText)}</strong></div>
+        ${Prefs.get('lastBackupFile', null) ? `<p class="hint" style="margin-top:-8px">${esc(Prefs.get('lastBackupFile', ''))}${Prefs.get('lastBackupCount', null) != null ? ` · ${Prefs.get('lastBackupCount', 0)} ${plural(Prefs.get('lastBackupCount', 0), 'Produkt', 'Produkte')}` : ''}</p>` : ''}
         <button class="btn btn-primary btn-block" type="button" data-action="backup">Backup erstellen</button>
         <p class="hint" style="margin-top:-6px">Sichert alle Produkte und Rechnungen in einer Datei.</p>
         <button class="btn btn-secondary btn-block" type="button" data-action="restore">Backup wiederherstellen</button>
@@ -4232,46 +4234,57 @@ function viewSettings() {
 function viewPrivacy() {
   return `<article class="card prose legal"><p class="legal-meta">Datenschutzerklärung für die App „Belegwächter“ · Stand: Oktober 2026</p>
 
-<h2>1. Verantwortliche Stelle</h2>
+<h2>1. Verantwortliche</h2>
+<p>Verantwortlich für die Datenverarbeitung im Sinne der Datenschutz-Grundverordnung (DSGVO) ist:</p>
 <p>Pelin Mösch (AraStudio)<br>Johannesweg 42<br>53937 Schleiden<br>Deutschland<br>E-Mail: <a href="mailto:aranea.studioo@gmail.com">aranea.studioo@gmail.com</a></p>
+<p>Ein Datenschutzbeauftragter ist nicht bestellt, da hierzu keine gesetzliche Pflicht besteht.</p>
 
-<h2>2. Das Wichtigste in Kürze</h2>
-<p>Belegwächter speichert deine Produkte, Rechnungen und Fotos ausschließlich auf deinem Gerät. Es gibt kein Benutzerkonto, keine Werbung und keine Analyse- oder Tracking-Dienste. Deine Einträge werden weder an mich noch an Dritte übermittelt.</p>
+<h2>2. Überblick</h2>
+<p>Belegwächter ist eine App zur Verwaltung von Garantien und Rechnungen. Die App ist so gestaltet, dass Ihre Einträge ausschließlich auf Ihrem Gerät verarbeitet werden. Es ist kein Benutzerkonto erforderlich. Die App enthält keine Werbung und verwendet keine Analyse-, Tracking- oder Werbedienste. Ihre gespeicherten Einträge werden weder an mich noch an Dritte übermittelt.</p>
+<p>Diese Datenschutzerklärung gilt für die Android-App aus dem Google Play Store sowie für die Web-Version der App.</p>
 
-<h2>3. Daten, die du in der App speicherst</h2>
-<p>Du kannst Angaben zu deinen Käufen speichern, z. B. Produktname, Kategorie, Kaufdatum, Kaufpreis, Händler, Serien- und Modellnummer, Garantiezeit, Erinnerungen und Notizen, sowie Rechnungen als Foto oder PDF.</p>
-<ul>
-<li><strong>Speicherort:</strong> ausschließlich im lokalen Speicher der App auf deinem Gerät. Ich habe darauf keinen Zugriff.</li>
-<li><strong>Zweck:</strong> die Verwaltung deiner Garantien und Rechnungen.</li>
-<li><strong>Speicherdauer:</strong> bis du die Daten löschst, z. B. einzeln, über „Alle Daten löschen“ in den Einstellungen oder durch Deinstallieren der App.</li>
-</ul>
-<p>Zusätzlich speichert die App einige Einstellungen auf dem Gerät, z. B. Hell- oder Dunkelmodus und den Zeitpunkt deines letzten Backups. Das ist für die Funktion der App technisch erforderlich (§ 25 Abs. 2 Nr. 2 TDDDG). Cookies, Analyse- oder Werbedienste werden nicht verwendet.</p>
-${Cloud.enabled() ? `<h2>Cloud-Sicherung (freiwillig)</h2>
-<p>Meldest du dich in den Einstellungen mit deinem Google-Konto an, werden deine Produkte und Rechnungen bei Google Firebase gespeichert, damit du sie auf einem anderen Gerät wiederherstellen kannst. Gespeichert werden dabei auch deine Google-Kontodaten (E-Mail-Adresse, Name, Konto-ID). Rechtsgrundlage ist deine Einwilligung (Art. 6 Abs. 1 lit. a DSGVO), die du jederzeit über „Cloud-Sicherung und Konto löschen“ widerrufen kannst; dabei wird alles vollständig entfernt.</p>` : ''}
-<h2>4. Rechnung scannen (Texterkennung)</h2>
-<p>Rechnungen werden direkt auf deinem Gerät ausgelesen. Fotos und PDFs werden dafür nicht hochgeladen. Die Programmdateien der Texterkennung werden beim ersten Gebrauch einmalig vom selben Server geladen wie die App selbst (siehe Abschnitt 7). Kopierst du Text aus einer anderen App hinein, z. B. aus Google Lens, gelten für das Erkennen die Bestimmungen dieses Anbieters.</p>
+<h2>3. Verarbeitung auf Ihrem Gerät</h2>
+<p><strong>Art der Daten:</strong> Angaben, die Sie selbst eingeben oder aus einer Rechnung übernehmen, insbesondere Produktname, Kategorie, Kaufdatum, Kaufpreis, Händler, Serien- und Modellnummer, Garantiezeit, Erinnerungen und Notizen, sowie Rechnungen als Foto oder PDF.</p>
+<p><strong>Zweck:</strong> Verwaltung Ihrer Garantien und Rechnungen, Berechnung von Garantiefristen und Anzeige von Erinnerungen.</p>
+<p><strong>Speicherort:</strong> ausschließlich im lokalen Speicher der App auf Ihrem Gerät. Ich habe keinen Zugriff auf diese Daten.</p>
+<p><strong>Speicherdauer:</strong> bis Sie die Daten löschen, z. B. einzeln, über „Alle Daten löschen“ in den Einstellungen oder durch Deinstallation der App bzw. Löschen der Website-Daten im Browser.</p>
+<p>Zusätzlich speichert die App einige Einstellungen auf Ihrem Gerät, z. B. das gewählte Farbschema und den Zeitpunkt des letzten Backups. Diese Speicherung ist für die Bereitstellung der von Ihnen gewünschten Funktionen unbedingt erforderlich (§ 25 Abs. 2 Nr. 2 TDDDG). Cookies werden nicht verwendet.</p>
 
-<h2>5. Kamera, Dateien und Downloads</h2>
-<p>Die App greift nur auf Kamera oder Dateien zu, wenn du selbst eine Rechnung scannst oder hochlädst. Beim Scannen wird das Kamerabild nur auf dem Gerät ausgewertet; gespeichert wird allein das aufgenommene Foto als Rechnung. Die Kamera-Erlaubnis kannst du jederzeit in den Android-Einstellungen widerrufen. Backups, PDF-Exporte und Kalenderdateien erstellst du selbst; sie werden dort gespeichert, wo du es wählst, meist im Ordner „Download“. Backup-Dateien sind nicht verschlüsselt: Wer die Datei hat, kann die Einträge sehen. Bewahre sie daher sicher auf. Speicherst du sie bei einem Cloud-Dienst wie Google Drive, gelten dessen Bestimmungen.</p>
+<h2>4. Erfassung von Rechnungen (Kamera, Dateien, Texterkennung)</h2>
+<p>Die App greift nur dann auf die Kamera oder auf Dateien zu, wenn Sie selbst eine Rechnung scannen oder hochladen. Für den Zugriff auf die Kamera ist Ihre Erlaubnis im Android-System erforderlich, die Sie jederzeit in den Android-Einstellungen widerrufen können. Beim Scannen wird das Kamerabild ausschließlich auf Ihrem Gerät ausgewertet; gespeichert wird nur das aufgenommene Foto als Rechnung.</p>
+<p>Die Texterkennung, mit der Angaben aus Rechnungen automatisch eingetragen werden, läuft vollständig auf Ihrem Gerät. Fotos und PDF-Dateien werden dafür nicht übertragen. Die Programmdateien der Texterkennung werden beim ersten Gebrauch einmalig vom selben Server geladen wie die App selbst (siehe Abschnitt 7).</p>
+<p>Fügen Sie Text aus einer anderen App ein, z. B. aus Google Lens, gelten für die dortige Verarbeitung die Datenschutzbestimmungen des jeweiligen Anbieters.</p>
 
-<h2>6. Benachrichtigungen</h2>
-<p>Wenn du Benachrichtigungen erlaubst, prüft die App regelmäßig auf deinem Gerät, ob eine Garantie bald abläuft, und zeigt dann eine Benachrichtigung an. Dafür werden keine Daten an einen Server gesendet. Rechtsgrundlage ist deine Einwilligung (Art. 6 Abs. 1 lit. a DSGVO), die du jederzeit in der App oder in den Android-Einstellungen widerrufen kannst.</p>
+<h2>5. Benachrichtigungen</h2>
+<p>Wenn Sie Benachrichtigungen erlauben, prüft die App regelmäßig auf Ihrem Gerät, ob eine Garantie bald abläuft, und zeigt dann eine Benachrichtigung an. Dafür werden keine Daten an einen Server gesendet. Rechtsgrundlage ist Ihre Einwilligung (Art. 6 Abs. 1 lit. a DSGVO, § 25 Abs. 1 TDDDG). Sie können die Einwilligung jederzeit in der App oder in den Android-Einstellungen widerrufen.</p>
+
+<h2>6. Backups, PDF-Export und Kalenderdateien</h2>
+<p>Backups, PDF-Exporte und Kalenderdateien werden nur auf Ihre Veranlassung erstellt und dort gespeichert, wo Sie es festlegen, in der Regel im Ordner „Download“ Ihres Geräts. Backup-Dateien sind nicht verschlüsselt; wer eine solche Datei besitzt, kann die darin enthaltenen Einträge einsehen. Bitte bewahren Sie diese Dateien daher sorgfältig auf. Speichern Sie Dateien bei einem Cloud-Dienst wie Google Drive oder geben Sie sie an Dritte weiter, gelten die Bestimmungen des jeweiligen Anbieters.</p>
+
+${Cloud.enabled() ? `<h2>Freiwillige Cloud-Sicherung</h2>
+<p>Wenn Sie sich in den Einstellungen mit Ihrem Google-Konto anmelden, werden Ihre Produkte und Rechnungen bei Google Firebase, einem Dienst von Google, gespeichert, damit Sie diese auf einem anderen Gerät wiederherstellen können. Dabei werden auch Ihre Kontodaten (E-Mail-Adresse, Name, Konto-ID) verarbeitet. Rechtsgrundlage ist Ihre Einwilligung (Art. 6 Abs. 1 lit. a DSGVO). Sie können die Einwilligung jederzeit über „Cloud-Sicherung und Konto löschen“ widerrufen; dabei werden alle in der Cloud gespeicherten Daten vollständig gelöscht.</p>` : ''}
 
 <h2>7. Bereitstellung der App (Hosting)</h2>
-<p>Die App-Dateien werden über GitHub Pages bereitgestellt, einen Dienst der GitHub, Inc., 88 Colin P. Kelly Jr. Street, San Francisco, CA 94107, USA. Beim Laden der App verarbeitet GitHub technisch notwendige Zugriffsdaten, insbesondere deine IP-Adresse, Datum und Uhrzeit des Abrufs sowie Angaben zu Browser und Betriebssystem, um die Dateien auszuliefern und den Dienst abzusichern. Ich selbst erhalte diese Zugriffsdaten nicht. Rechtsgrundlage ist mein berechtigtes Interesse an einer sicheren und zuverlässigen Bereitstellung der App (Art. 6 Abs. 1 lit. f DSGVO). Dabei können Daten in die USA übermittelt werden; GitHub stützt solche Übermittlungen nach eigenen Angaben auf das EU-US Data Privacy Framework und auf Standardvertragsklauseln. Weitere Informationen: <a href="https://docs.github.com/de/site-policy/privacy-policies/github-general-privacy-statement" target="_blank" rel="noopener">Datenschutzerklärung von GitHub</a>. Deine in der App gespeicherten Einträge werden dabei nicht übertragen.</p>
+<p>Die Dateien der App werden über GitHub Pages bereitgestellt, einen Dienst der GitHub, Inc., 88 Colin P. Kelly Jr. Street, San Francisco, CA 94107, USA. Beim Abruf der App verarbeitet GitHub technisch notwendige Zugriffsdaten, insbesondere Ihre IP-Adresse, Datum und Uhrzeit des Abrufs sowie Angaben zu Browser und Betriebssystem, um die Dateien auszuliefern und die Sicherheit des Dienstes zu gewährleisten. Ich selbst erhalte diese Zugriffsdaten nicht.</p>
+<p>Rechtsgrundlage ist mein berechtigtes Interesse an einer sicheren und zuverlässigen Bereitstellung der App (Art. 6 Abs. 1 lit. f DSGVO). Dabei können Daten in die USA übermittelt werden. GitHub stützt solche Übermittlungen nach eigenen Angaben auf das EU-US Data Privacy Framework sowie auf Standardvertragsklauseln der Europäischen Kommission. Weitere Informationen finden Sie in der <a href="https://docs.github.com/de/site-policy/privacy-policies/github-general-privacy-statement" target="_blank" rel="noopener">Datenschutzerklärung von GitHub</a>. Ihre in der App gespeicherten Einträge werden dabei nicht übertragen.</p>
 
 <h2>8. Google Play</h2>
-<p>Wenn du die App über Google Play installierst, verarbeitet Google dabei Daten in eigener Verantwortung, z. B. für Download, Updates und Zahlungsabwicklung. Über die Google Play Console erhalte ich zusammengefasste Statistiken, etwa zur Zahl der Installationen, und – falls du das auf deinem Gerät erlaubt hast – Absturzberichte ohne Bezug zu deinen Einträgen. Weitere Informationen: <a href="https://policies.google.com/privacy?hl=de" target="_blank" rel="noopener">Datenschutzerklärung von Google</a>.</p>
+<p>Wenn Sie die App über Google Play installieren, verarbeitet Google dabei Daten in eigener Verantwortung, z. B. für Download, Aktualisierungen und gegebenenfalls Zahlungen. Über die Google Play Console erhalte ich zusammengefasste Statistiken, etwa zur Zahl der Installationen, sowie – sofern Sie dies auf Ihrem Gerät erlaubt haben – Absturzberichte ohne Bezug zu Ihren Einträgen. Weitere Informationen finden Sie in der <a href="https://policies.google.com/privacy?hl=de" target="_blank" rel="noopener">Datenschutzerklärung von Google</a>.</p>
 
-<h2>9. Kontakt per E-Mail</h2>
-<p>Wenn du mir eine E-Mail schreibst, verarbeite ich deine E-Mail-Adresse und den Inhalt deiner Nachricht, um deine Anfrage zu beantworten (Art. 6 Abs. 1 lit. f DSGVO). Die Nachricht wird gelöscht, sobald die Anfrage erledigt ist und keine gesetzlichen Aufbewahrungspflichten bestehen. Mein E-Mail-Postfach wird von Google (Gmail) bereitgestellt.</p>
+<h2>9. Kontaktaufnahme per E-Mail</h2>
+<p>Wenn Sie mich per E-Mail kontaktieren, verarbeite ich Ihre E-Mail-Adresse und den Inhalt Ihrer Nachricht, um Ihre Anfrage zu bearbeiten. Rechtsgrundlage ist Art. 6 Abs. 1 lit. b DSGVO, soweit Ihre Anfrage die Nutzung der App betrifft, im Übrigen mein berechtigtes Interesse an der Beantwortung von Anfragen (Art. 6 Abs. 1 lit. f DSGVO). Ihre Nachricht wird gelöscht, sobald die Anfrage abschließend bearbeitet ist und keine gesetzlichen Aufbewahrungspflichten entgegenstehen. Das E-Mail-Postfach wird von Google (Gmail) bereitgestellt.</p>
 
-<h2>10. Deine Rechte</h2>
-<p>Du hast nach der DSGVO das Recht auf Auskunft (Art. 15), Berichtigung (Art. 16), Löschung (Art. 17), Einschränkung der Verarbeitung (Art. 18), Datenübertragbarkeit (Art. 20) und Widerspruch (Art. 21). Eine erteilte Einwilligung kannst du jederzeit mit Wirkung für die Zukunft widerrufen (Art. 7 Abs. 3). Da deine Einträge nur auf deinem Gerät liegen, kannst du sie jederzeit selbst einsehen, als Backup exportieren und löschen.</p>
-<p>Außerdem kannst du dich bei einer Datenschutz-Aufsichtsbehörde beschweren (Art. 77 DSGVO). Zuständig ist: Landesbeauftragte für Datenschutz und Informationsfreiheit Nordrhein-Westfalen, <a href="https://www.ldi.nrw.de" target="_blank" rel="noopener">www.ldi.nrw.de</a>.</p>
+<h2>10. Empfänger, automatisierte Entscheidungen und Datensicherheit</h2>
+<p>Über die in dieser Erklärung genannten Dienstleister hinaus werden keine personenbezogenen Daten an Dritte weitergegeben oder verkauft. Eine automatisierte Entscheidungsfindung einschließlich Profiling (Art. 22 DSGVO) findet nicht statt.</p>
+<p>Die App wird ausschließlich über eine verschlüsselte Verbindung (HTTPS) bereitgestellt. Ihre Einträge sind durch die Sicherheitsmechanismen Ihres Geräts geschützt; bitte verwenden Sie eine Bildschirmsperre.</p>
 
-<h2>11. Änderungen</h2>
-<p>Ich passe diese Datenschutzerklärung an, wenn sich die App oder die Rechtslage ändert. Es gilt die jeweils in der App und unter der Adresse dieser Seite veröffentlichte Fassung.</p></article>`;
+<h2>11. Ihre Rechte</h2>
+<p>Sie haben nach der DSGVO das Recht auf Auskunft (Art. 15), Berichtigung (Art. 16), Löschung (Art. 17), Einschränkung der Verarbeitung (Art. 18) und Datenübertragbarkeit (Art. 20). Eine erteilte Einwilligung können Sie jederzeit mit Wirkung für die Zukunft widerrufen (Art. 7 Abs. 3 DSGVO). Da Ihre Einträge ausschließlich auf Ihrem Gerät gespeichert sind, können Sie diese jederzeit selbst einsehen, als Backup exportieren und löschen.</p>
+<p><strong>Widerspruchsrecht:</strong> Soweit eine Verarbeitung auf Art. 6 Abs. 1 lit. f DSGVO beruht, können Sie aus Gründen, die sich aus Ihrer besonderen Situation ergeben, jederzeit Widerspruch einlegen (Art. 21 DSGVO). Wenden Sie sich dazu an die oben genannte E-Mail-Adresse.</p>
+<p><strong>Beschwerderecht:</strong> Sie haben das Recht, sich bei einer Datenschutz-Aufsichtsbehörde zu beschweren (Art. 77 DSGVO). Zuständig ist die Landesbeauftragte für Datenschutz und Informationsfreiheit Nordrhein-Westfalen, <a href="https://www.ldi.nrw.de" target="_blank" rel="noopener">www.ldi.nrw.de</a>.</p>
+
+<h2>12. Änderungen dieser Datenschutzerklärung</h2>
+<p>Ich passe diese Datenschutzerklärung an, wenn sich die App, die eingesetzten Dienste oder die Rechtslage ändern. Es gilt die jeweils in der App und unter der Internetadresse dieser Seite veröffentlichte Fassung.</p></article>`;
 }
 
 /* ---------- Lizenzen ---------- */
