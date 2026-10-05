@@ -1959,7 +1959,7 @@ const ReceiptParser = {
 
   /* ---------- Serien- und Modellnummer ---------- */
   findSerial(text) {
-    const m = /(?:\bs\/?n\b|seriennummer|serien-?nr\.?|serial\s*(?:no\.?|number)?)\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-\/]{4,39})/i.exec(text)
+    const m = /(?:\bs\/?n\b|seriennummer|serien-?nr\.?|serial\s*(?:no\.?|number)?)\s*[:#.]?\s*((?=[A-Z0-9\-\/]*\d)[A-Z0-9][A-Z0-9\-\/]{4,39})/i.exec(text)
       || /\bimei\s*(?:1)?\s*[:#]?\s*(\d{15})\b/i.exec(text)
       || /\b(?:fin|vin|fahrgestell(?:nummer|-?nr\.?)?)\s*[:#.]?\s*([A-HJ-NPR-Z0-9]{17})\b/i.exec(text)
       || /\b((?=[A-HJ-NPR-Z0-9]{17}\b)(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-HJ-NPR-Z])[A-HJ-NPR-Z0-9]{17})\b/.exec(text); // Fahrzeug-Identnummer (FIN)
@@ -2042,7 +2042,9 @@ const ReceiptParser = {
       const letters = (name.match(/[a-zäöüß]/gi) || []).length;
       if (letters < 4 || name.length > 90) return;
       let score = 0;
-      name = name.replace(/(?:\s+-?[\d.,]+){1,4}\s*$/, '').replace(/^\s*[A-Za-z]\s+(?=\S)/, '').trim();
+      name = name.replace(/^[^A-Za-zÄÖÜäöü0-9]+/, '');
+      { const ws = name.split(' '); while (ws.length > 1 && /^[a-zäöü]{1,2}$/.test(ws[ws.length - 1]) && !/^(kg|l|ml|cm|mm|m|w|v|gb|tb|xl|xs)$/i.test(ws[ws.length - 1])) ws.pop(); name = ws.join(' '); }
+      name = name.replace(/(?:\s+(?:-?[\d.,]+|[^\wäöüÄÖÜß\s]{1,3}))+\s*$/, '').replace(/^\s*[A-Za-z]\s+(?=\S)/, '').trim();
       const strong = brandRe.test(name) || !!ReceiptParser.typeOf(name);
       if (brandRe.test(name)) score += 6;
       if (ReceiptParser.typeOf(name)) score += 5;
@@ -2060,18 +2062,41 @@ const ReceiptParser = {
   },
 
   /** Hauptfunktion. today = ISO-Datum, isValid = Datumsprüfung (aus DateUtil). */
+  BILLING: /^(d[z2][r1]|ozr|pvs|zab|abz|bfs|unimed|mediserv|medas|dmrz|rzh|health|avp|ihre-zahnabrechnung)\b/i,
+  /** Art der Dienstleistung anhand typischer Wörter (auch bei Lesefehlern im Briefkopf). */
+  serviceKind(text) {
+    const t = text.toLowerCase();
+    if (/tierarzt|tierärzt|tierklinik|\bgot\b/.test(t)) return 'Tierarztrechnung';
+    if (/zahnarzt|zahnärzt|zahnmedizin|kavit[aä]t|\bbema\b|zähne|zahne|füllmaterial|fullmaterial|prophylaxe|kieferorthop|zahnreinigung|implantat/.test(t)) return 'Zahnarztrechnung';
+    if (/\bgo[aä]\b|ärztliche|arztpraxis|hausarzt|facharzt|behandelte person|behandlungszeitraum|patient/.test(t)) return 'Arztrechnung';
+    if (/werkstatt|inspektion|hauptuntersuchung|ölwechsel|olwechsel|reifenwechsel|probefahrt|kfz-meister/.test(t)) return 'Werkstattrechnung';
+    return null;
+  },
+  /** Grobe Plausibilität einer erkannten Zeile: überwiegend Buchstaben, kein Zeichensalat. */
+  looksClean(name) {
+    const chars = name.replace(/\s/g, ''), letters = (chars.match(/[a-zäöüß]/gi) || []).length;
+    return chars.length >= 3 && letters / chars.length >= 0.7 && !/[£$§|{}<>~^_\\]/.test(name);
+  },
   parse(text, today, isValid) {
     const lines = ReceiptParser.lines(text);
     const out = { name: null, category: null, purchaseDate: null, price: null, priceCents: null, retailer: null, serialNumber: null, modelNumber: null };
     if (!lines.length) return out;
     const joined = lines.join('\n');
     out.retailer = ReceiptParser.findRetailer(lines);
+    // Abrechnungsstellen (z. B. für Zahnärzte) sind nicht der eigentliche Anbieter
+    if (out.retailer && ReceiptParser.BILLING.test(out.retailer)) out.retailer = null;
     out.purchaseDate = ReceiptParser.findDate(lines, today, isValid);
     const total = ReceiptParser.findTotal(lines, today);
     if (total) { out.priceCents = total.cents; out.price = (total.cents / 100).toFixed(2).replace('.', ','); }
     out.serialNumber = ReceiptParser.findSerial(joined);
     let found = ReceiptParser.findProduct(lines, today, total ? total.line : null, out.retailer);
-    if (found && !found.strong && out.retailer) found = { name: 'Rechnung ' + out.retailer, strong: false, cents: 0 };
+    if (!found || !found.strong) {
+      // Dienstleistung statt Produkt: verständlicher Name statt einer zufälligen Zeile
+      const kind = ReceiptParser.serviceKind(text);
+      if (kind) found = { name: kind + (out.retailer ? ' ' + out.retailer : ''), strong: false, cents: 0 };
+      else if (found && out.retailer) found = { name: 'Rechnung ' + out.retailer, strong: false, cents: 0 };
+      else if (found && !ReceiptParser.looksClean(found.name)) found = null;
+    }
     let product = found ? found.name : null;
     let model = ReceiptParser.findModel(joined);
     // Mehrere Artikel auf der Rechnung: Für die Garantie zählt der Preis des Produkts, nicht die Gesamtsumme.
@@ -2163,15 +2188,16 @@ const TessOCR = {
   },
   /**
    * Bild für die Erkennung aufbereiten (Fotos von Papierbelegen):
-   *  1. passende Größe, optional um 90°/270° drehen
-   *  2. Graustufen
-   *  3. Schräglage erkennen und gerade drehen (bis ±12°)
-   *  4. ungleichmäßiges Licht/Schatten ausgleichen: lokale Schwelle (Bradley) → klares Schwarz-Weiß
+   *  1. passende Größe, optional um 90°/270° drehen, Graustufen
+   *  2. Papier erkennen: Hintergrund (Tisch, Decke …) entfernen, Beleg ausschneiden und
+   *     perspektivisch entzerren – wie ein Dokumentenscanner
+   *  3. restliche Schräglage gerade drehen
+   *  4. Schatten und ungleichmäßiges Licht ausgleichen (lokale Schwelle) → klares Schwarz-Weiß
    */
   async prepare(blob, rotate) {
     const bmp = await createImageBitmap(blob);
     const m = Math.max(bmp.width, bmp.height);
-    const sc = Math.min(2400 / m, Math.max(1, 1600 / m));
+    const sc = Math.min(2600 / m, Math.max(1, 1700 / m));
     const w = Math.max(1, Math.round(bmp.width * sc)), h = Math.max(1, Math.round(bmp.height * sc));
     const turned = rotate % 180 !== 0;
     const draw = (deg, cw, ch) => {
@@ -2180,6 +2206,7 @@ const TessOCR = {
       x.fillStyle = '#fff'; x.fillRect(0, 0, cw, ch);
       x.translate(cw / 2, ch / 2); x.rotate(deg * Math.PI / 180);
       x.drawImage(bmp, -w / 2, -h / 2, w, h);
+      x.setTransform(1, 0, 0, 1, 0, 0);
       return { c, x };
     };
     const gray = (x, cw, ch) => {
@@ -2190,43 +2217,202 @@ const TessOCR = {
     let cw = turned ? h : w, ch = turned ? w : h;
     let { c, x } = draw(rotate, cw, ch);
     let g = gray(x, cw, ch);
-    // Schräglage: Projektionsprofil der Schriftpixel auf einer verkleinerten, lokal binarisierten Kopie
-    const skew = TessOCR.skewAngle(g, cw, ch);
-    if (Math.abs(skew) >= 0.4) {
-      const r = Math.abs(skew) * Math.PI / 180;
-      const nw = Math.ceil(cw * Math.cos(r) + ch * Math.sin(r)), nh = Math.ceil(ch * Math.cos(r) + cw * Math.sin(r));
-      ({ c, x } = draw(rotate - skew, nw, nh));
-      cw = nw; ch = nh; g = gray(x, cw, ch);
+    if (bmp.close) bmp.close();
+    // 2. Beleg ausschneiden und entzerren
+    let cropped = false;
+    const quad = TessOCR.findPaper(g, cw, ch);
+    if (quad) {
+      const r = TessOCR.warp(g, cw, ch, quad);
+      g = r.g; cw = r.w; ch = r.h; cropped = true;
     }
+    // 3. Schräglage und – nach dem Entzerren – Scherung („kursive“ Schrift durch ungenaue Ecken)
+    const skew = TessOCR.skewAngle(g, cw, ch, cropped ? 8 : 12);
+    if (Math.abs(skew) >= 0.4) {
+      const rot = TessOCR.rotateGray(g, cw, ch, -skew);
+      g = rot.g; cw = rot.w; ch = rot.h;
+    }
+    if (cropped) {
+      const sh = TessOCR.shearAngle(g, cw, ch);
+      if (Math.abs(sh) >= 0.6) { const r2 = TessOCR.shearGray(g, cw, ch, sh); g = r2.g; cw = r2.w; ch = r2.h; }
+    }
+    // 4. Schwarz-Weiß
     const out = TessOCR.binarize(g, cw, ch);
+    c = document.createElement('canvas'); c.width = cw; c.height = ch;
+    x = c.getContext('2d');
     const img = x.createImageData(cw, ch), d = img.data;
     for (let i = 0, j = 0; j < out.length; i += 4, j++) { d[i] = d[i + 1] = d[i + 2] = out[j]; d[i + 3] = 255; }
-    x.setTransform(1, 0, 0, 1, 0, 0); x.putImageData(img, 0, 0);
-    if (bmp.close) bmp.close();
+    x.putImageData(img, 0, 0);
     const blobOut = await new Promise(r2 => c.toBlob(r2, 'image/png'));
-    return { blob: blobOut, landscape: cw > ch * 1.15, skew };
+    return { blob: blobOut, landscape: cw > ch * 1.15, skew, crop: cropped ? quad : null };
   },
-  /** Schräglage in Grad (positiv = im Uhrzeigersinn gedreht). */
-  skewAngle(g, w, h) {
+  /** Otsu-Schwelle eines Graustufen-Arrays. */
+  otsu(g) {
+    const hist = new Float64Array(256);
+    for (let i = 0; i < g.length; i++) hist[g[i]]++;
+    let sum = 0; for (let t = 0; t < 256; t++) sum += t * hist[t];
+    let sumB = 0, wB = 0, best = 0, bestT = 127;
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t]; if (!wB) continue;
+      const wF = g.length - wB; if (!wF) break;
+      sumB += t * hist[t];
+      const mB = sumB / wB, mF = (sum - sumB) / wF, between = wB * wF * (mB - mF) * (mB - mF);
+      if (between > best) { best = between; bestT = t; }
+    }
+    return bestT;
+  },
+  /**
+   * Sucht das Papier im Foto: helle Fläche, die nicht mit dem dunkleren Hintergrund am Bildrand verbunden ist.
+   * Liefert die vier Ecken [lo, ro, ru, lu] in Bildkoordinaten oder null (z. B. bei Screenshots oder randlosen Fotos).
+   */
+  findPaper(g, w, h) {
+    const step = Math.max(1, Math.round(Math.max(w, h) / 420));
+    const sw = Math.floor(w / step), sh = Math.floor(h / step), s = new Uint8ClampedArray(sw * sh);
+    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) {
+      // kleiner Mittelwert gegen Rauschen und Schrift
+      let a = 0, n = 0;
+      for (let dy = 0; dy < step; dy += Math.max(1, step >> 1)) for (let dx = 0; dx < step; dx += Math.max(1, step >> 1)) { a += g[(y * step + dy) * w + xx * step + dx]; n++; }
+      s[y * sw + xx] = a / n;
+    }
+    const t = TessOCR.otsu(s);
+    let bright = 0; for (let i = 0; i < s.length; i++) if (s[i] > t) bright++;
+    // Hintergrund = dunkle Pixel, die vom Bildrand aus erreichbar sind
+    const bg = new Uint8Array(sw * sh), stack = [];
+    const push = i => { if (!bg[i] && s[i] <= t) { bg[i] = 1; stack.push(i); } };
+    for (let xx = 0; xx < sw; xx++) { push(xx); push((sh - 1) * sw + xx); }
+    for (let y = 0; y < sh; y++) { push(y * sw); push(y * sw + sw - 1); }
+    while (stack.length) {
+      const i = stack.pop(), y = (i / sw) | 0, xx = i - y * sw;
+      if (xx > 0) push(i - 1); if (xx < sw - 1) push(i + 1); if (y > 0) push(i - sw); if (y < sh - 1) push(i + sw);
+    }
+    let bgN = 0; for (let i = 0; i < bg.length; i++) bgN += bg[i];
+    const frac = 1 - bgN / bg.length;
+    if (bgN < bg.length * 0.04 || frac < 0.2) return null; // kaum Hintergrund oder Papier zu klein
+    // Ecken: Extrempunkte der Papierfläche
+    let tl = null, tr = null, br = null, bl = null, vtl = Infinity, vtr = -Infinity, vbr = -Infinity, vbl = -Infinity;
+    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) {
+      if (bg[y * sw + xx]) continue;
+      const a = xx + y, b = xx - y;
+      if (a < vtl) { vtl = a; tl = [xx, y]; }
+      if (b > vtr) { vtr = b; tr = [xx, y]; }
+      if (a > vbr) { vbr = a; br = [xx, y]; }
+      if (-b > vbl) { vbl = -b; bl = [xx, y]; }
+    }
+    const q = [tl, tr, br, bl].map(([px, py]) => [(px + 0.5) * step, (py + 0.5) * step]);
+    const len = (p, r) => Math.hypot(p[0] - r[0], p[1] - r[1]);
+    const top = len(q[0], q[1]), bottom = len(q[3], q[2]), left = len(q[0], q[3]), right = len(q[1], q[2]);
+    // Plausibilität: Viereck groß genug und nicht verzerrt
+    const area = Math.abs((q[0][0] * q[1][1] - q[1][0] * q[0][1]) + (q[1][0] * q[2][1] - q[2][0] * q[1][1]) + (q[2][0] * q[3][1] - q[3][0] * q[2][1]) + (q[3][0] * q[0][1] - q[0][0] * q[3][1])) / 2;
+    if (area < w * h * 0.18) return null;
+    if (Math.min(top, bottom) / Math.max(top, bottom) < 0.6 || Math.min(left, right) / Math.max(left, right) < 0.6) return null;
+    // kleine Zugabe nach innen, damit keine dunkle Papierkante übrig bleibt
+    const cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4, cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4;
+    return q.map(([px, py]) => [px + (cx - px) * 0.012, py + (cy - py) * 0.012]);
+  },
+  /** Perspektivisch entzerren: Viereck → Rechteck (Homographie, bilineare Abtastung). */
+  warp(g, w, h, q) {
+    const len = (p, r) => Math.hypot(p[0] - r[0], p[1] - r[1]);
+    let ow = Math.round((len(q[0], q[1]) + len(q[3], q[2])) / 2), oh = Math.round((len(q[0], q[3]) + len(q[1], q[2])) / 2);
+    const lim = 2600 / Math.max(ow, oh); if (lim < 1) { ow = Math.round(ow * lim); oh = Math.round(oh * lim); }
+    // Homographie H: Zielrechteck → Quellviereck
+    const dst = [[0, 0], [ow, 0], [ow, oh], [0, oh]], A = [], B = [];
+    for (let i = 0; i < 4; i++) {
+      const [u, v] = dst[i], [X, Y] = q[i];
+      A.push([u, v, 1, 0, 0, 0, -u * X, -v * X]); B.push(X);
+      A.push([0, 0, 0, u, v, 1, -u * Y, -v * Y]); B.push(Y);
+    }
+    const H = TessOCR.solve(A, B);
+    if (!H) return { g, w, h };
+    const out = new Uint8ClampedArray(ow * oh).fill(255);
+    for (let v = 0; v < oh; v++) {
+      for (let u = 0; u < ow; u++) {
+        const den = H[6] * u + H[7] * v + 1;
+        const sx = (H[0] * u + H[1] * v + H[2]) / den, sy = (H[3] * u + H[4] * v + H[5]) / den;
+        const x0 = Math.floor(sx), y0 = Math.floor(sy);
+        if (x0 < 0 || y0 < 0 || x0 >= w - 1 || y0 >= h - 1) continue;
+        const fx = sx - x0, fy = sy - y0, k = y0 * w + x0;
+        out[v * ow + u] = (g[k] * (1 - fx) + g[k + 1] * fx) * (1 - fy) + (g[k + w] * (1 - fx) + g[k + w + 1] * fx) * fy;
+      }
+    }
+    return { g: out, w: ow, h: oh };
+  },
+  /** Lineares Gleichungssystem (Gauß mit Pivotsuche). */
+  solve(A, B) {
+    const n = B.length, M = A.map((r, i) => [...r, B[i]]);
+    for (let c = 0; c < n; c++) {
+      let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+      if (Math.abs(M[p][c]) < 1e-9) return null;
+      [M[c], M[p]] = [M[p], M[c]];
+      for (let r = 0; r < n; r++) if (r !== c) { const f = M[r][c] / M[c][c]; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
+    }
+    return M.map((r, i) => r[n] / r[i]);
+  },
+  /** Graustufenbild drehen (Grad, im Uhrzeigersinn positiv), Ränder weiß. */
+  rotateGray(g, w, h, deg) {
+    const r = deg * Math.PI / 180, co = Math.cos(r), si = Math.sin(r);
+    const nw = Math.ceil(Math.abs(w * co) + Math.abs(h * si)), nh = Math.ceil(Math.abs(h * co) + Math.abs(w * si));
+    const out = new Uint8ClampedArray(nw * nh).fill(255), cx = w / 2, cy = h / 2, ncx = nw / 2, ncy = nh / 2;
+    for (let y = 0; y < nh; y++) for (let xx = 0; xx < nw; xx++) {
+      const dx = xx - ncx, dy = y - ncy;
+      const sx = co * dx + si * dy + cx, sy = -si * dx + co * dy + cy;
+      const x0 = Math.floor(sx), y0 = Math.floor(sy);
+      if (x0 < 0 || y0 < 0 || x0 >= w - 1 || y0 >= h - 1) continue;
+      const fx = sx - x0, fy = sy - y0, k = y0 * w + x0;
+      out[y * nw + xx] = (g[k] * (1 - fx) + g[k + 1] * fx) * (1 - fy) + (g[k + w] * (1 - fx) + g[k + w + 1] * fx) * fy;
+    }
+    return { g: out, w: nw, h: nh };
+  },
+  /** Scherwinkel in Grad: senkrechte Kanten (Textanfänge, Tabellenspalten) sollen senkrecht stehen. */
+  shearAngle(g, w, h) {
     const step = Math.max(1, Math.round(Math.max(w, h) / 1000));
     const sw = Math.floor(w / step), sh = Math.floor(h / step), small = new Uint8ClampedArray(sw * sh);
     for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) small[y * sw + xx] = g[(y * step) * w + xx * step];
-    const bin = TessOCR.binarize(small, sw, sh); // dunkle Flächen (Tisch, Schatten) werden weiß, Schrift schwarz
+    const bin = TessOCR.binarize(small, sw, sh);
+    // linke Kanten von Schrift: schwarz mit weißem linken Nachbarn
     const pts = [];
-    const mx = Math.round(sw * 0.02), my = Math.round(sh * 0.02);
+    for (let y = 1; y < sh - 1; y++) for (let xx = 1; xx < sw - 1; xx++) { const k = y * sw + xx; if (bin[k] === 0 && bin[k - 1] === 255) pts.push(xx, y); }
+    if (pts.length < 400) return 0;
+    const score = deg => {
+      const t = Math.tan(deg * Math.PI / 180), hist = new Float64Array(sw * 3);
+      for (let k = 0; k < pts.length; k += 2) { const xx = Math.round(pts[k] - pts[k + 1] * t) + sw; if (xx >= 0 && xx < hist.length) hist[xx]++; }
+      let sc = 0; for (let i = 0; i < hist.length; i++) sc += hist[i] * hist[i]; return sc;
+    };
+    let best = 0, bestS = score(0);
+    for (let deg = -10; deg <= 10; deg += 0.5) { const s1 = score(deg); if (s1 > bestS * 1.0001) { bestS = s1; best = deg; } }
+    return best;
+  },
+  /** Scherung entfernen: x' = x − y·tan(Winkel). */
+  shearGray(g, w, h, deg) {
+    const t = Math.tan(deg * Math.PI / 180), extra = Math.ceil(Math.abs(t) * h), nw = w + extra;
+    const out = new Uint8ClampedArray(nw * h).fill(255), off = t > 0 ? 0 : extra;
+    for (let y = 0; y < h; y++) {
+      const shift = y * t;
+      for (let xx = 0; xx < nw; xx++) {
+        const sx = xx - off + shift, x0 = Math.floor(sx);
+        if (x0 < 0 || x0 >= w - 1) continue;
+        const f = sx - x0, k = y * w + x0;
+        out[y * nw + xx] = g[k] * (1 - f) + g[k + 1] * f;
+      }
+    }
+    return { g: out, w: nw, h };
+  },
+  /** Schräglage in Grad (positiv = im Uhrzeigersinn gedreht). */
+  skewAngle(g, w, h, range = 12) {
+    const step = Math.max(1, Math.round(Math.max(w, h) / 1000));
+    const sw = Math.floor(w / step), sh = Math.floor(h / step), small = new Uint8ClampedArray(sw * sh);
+    for (let y = 0; y < sh; y++) for (let xx = 0; xx < sw; xx++) small[y * sw + xx] = g[(y * step) * w + xx * step];
+    const bin = TessOCR.binarize(small, sw, sh);
+    const pts = [];
+    const mx = Math.round(sw * 0.04), my = Math.round(sh * 0.04);
     for (let y = my; y < sh - my; y++) for (let xx = mx; xx < sw - mx; xx++) if (bin[y * sw + xx] === 0) pts.push(xx, y);
     if (pts.length < 400) return 0;
     const n = pts.length / 2, stride = n > 80000 ? Math.ceil(n / 80000) : 1, off = sw + sh;
     const score = deg => {
       const a = deg * Math.PI / 180, si = Math.sin(a), co = Math.cos(a), hist = new Float64Array(2 * off + 2);
-      for (let k = 0; k < pts.length; k += 2 * stride) {
-        const yy = Math.round(pts[k + 1] * co - pts[k] * si) + off;
-        hist[yy]++;
-      }
+      for (let k = 0; k < pts.length; k += 2 * stride) hist[Math.round(pts[k + 1] * co - pts[k] * si) + off]++;
       let sc = 0; for (let i = 0; i < hist.length; i++) sc += hist[i] * hist[i]; return sc;
     };
     let best = 0, bestS = -1;
-    for (let deg = -12; deg <= 12; deg += 1) { const s1 = score(deg); if (s1 > bestS) { bestS = s1; best = deg; } }
+    for (let deg = -range; deg <= range; deg += 1) { const s1 = score(deg); if (s1 > bestS) { bestS = s1; best = deg; } }
     const c0 = best;
     for (let deg = c0 - 0.9; deg <= c0 + 0.91; deg += 0.15) { const s1 = score(deg); if (s1 > bestS) { bestS = s1; best = deg; } }
     return Math.round(best * 100) / 100;
